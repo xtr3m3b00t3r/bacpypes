@@ -824,71 +824,9 @@ class TCPServerActor(TCPServer):
         # pass it along
         self.director.actor_flush(self)
 
-        # add a timer
-        self._idle_timeout = director.idle_timeout
-        if self._idle_timeout:
-            self.idle_timeout_task = FunctionTask(self.idle_timeout)
-            self.idle_timeout_task.install_task(_time() + self._idle_timeout)
-        else:
-            self.idle_timeout_task = None
 
-        # this may have a flush state
-        self.flush_task = None
 
-        # tell the director this is a new actor
-        self.director.add_actor(self)
 
-    async def start_serving(self):
-        if _debug: TCPServerActor._debug("start_serving")
-        try:
-            self.transport, _ = await self.loop.create_connection(
-                lambda: self._protocol,
-                sock=self.socket
-            )
-        except Exception as err:
-            if _debug: TCPServerActor._debug("    - server error: %r", err)
-            self.handle_error(err)
-
-    def handle_error(self, error=None):
-        """Trap for TCPServer errors, otherwise continue."""
-        if _debug: TCPServerActor._debug("handle_error %r", error)
-
-        # pass it along to the director
-        self.director.actor_error(self, error)
-
-    def handle_close(self):
-        if _debug: TCPServerActor._debug("handle_close")
-
-        # if there is an idle timeout task, cancel it
-        if self._idle_timeout:
-            self.idle_timeout_task.suspend_task()
-
-        # if there is a flush task, cancel it
-        if self.flush_task:
-            self.flush_task.suspend_task()
-
-        # tell the director this is gone
-        self.director.del_actor(self)
-
-        # pass it down
-        self.close()
-
-    def handle_error(self, error=None):
-        """Trap for TCPServer errors, otherwise continue."""
-        if _debug: TCPServerActor._debug("handle_error %r", error)
-
-        # pass along to the director
-        if error is not None:
-            self.director.actor_error(self, error)
-        else:
-            TCPServer.handle_error(self)
-
-    def handle_close(self):
-        if _debug: TCPServerActor._debug("handle_close")
-
-        # if there's a flush task, cancel it
-        if self.flush_task:
-            self.flush_task.suspend_task()
 
         # if there is an idle timeout, cancel it
         if self.idle_timeout_task:
