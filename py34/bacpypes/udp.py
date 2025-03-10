@@ -4,7 +4,7 @@
 UDP Communications Module
 """
 
-import asyncore
+import asyncio
 import socket
 import pickle
 import queue
@@ -90,6 +90,29 @@ class UDPActor:
 #
 
 @bacpypes_debugging
+@bacpypes_debugging
+class UDPDirectorProtocol(asyncio.DatagramProtocol):
+    def __init__(self, director):
+        if _debug: UDPDirectorProtocol._debug("__init__ %r", director)
+        self.director = director
+
+    def connection_made(self, transport):
+        if _debug: UDPDirectorProtocol._debug("connection_made %r", transport)
+        self.director.transport = transport
+
+    def datagram_received(self, data, addr):
+        if _debug: UDPDirectorProtocol._debug("datagram_received %d octets from %r", len(data), addr)
+        deferred(self.director.response, PDU(data, source=addr))
+
+    def error_received(self, exc):
+        if _debug: UDPDirectorProtocol._debug("error_received %r", exc)
+        self.director.handle_error(exc)
+
+    def connection_lost(self, exc):
+        if _debug: UDPDirectorProtocol._debug("connection_lost %r", exc)
+        if exc:
+            self.director.handle_error(exc)
+
 class UDPPickleActor(UDPActor):
 
     def __init__(self, *args):
@@ -123,7 +146,7 @@ class UDPPickleActor(UDPActor):
 #
 
 @bacpypes_debugging
-class UDPDirector(asyncore.dispatcher, Server, ServiceAccessPoint):
+class UDPDirector(Server, ServiceAccessPoint):
 
     def __init__(self, address, timeout=0, reuse=False, actorClass=UDPActor, sid=None, sapID=None):
         if _debug: UDPDirector._debug("__init__ %r timeout=%r reuse=%r actorClass=%r sid=%r sapID=%r", address, timeout, reuse, actorClass, sid, sapID)
@@ -141,32 +164,57 @@ class UDPDirector(asyncore.dispatcher, Server, ServiceAccessPoint):
         # save the address
         self.address = address
 
-        asyncore.dispatcher.__init__(self)
-
-        # ask the dispatcher for a socket
-        self.create_socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # create the socket
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.setblocking(False)
 
         # if the reuse parameter is provided, set the socket option
         if reuse:
-            self.set_reuse_addr()
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
         # proceed with the bind
         try:
-            self.bind(address)
+            self.socket.bind(address)
         except socket.error as err:
             if _debug: UDPDirector._debug("    - bind error: %r", err)
-            self.close()
+            self.socket.close()
             raise
         if _debug: UDPDirector._debug("    - getsockname: %r", self.socket.getsockname())
 
         # allow it to send broadcasts
-        self.socket.setsockopt( socket.SOL_SOCKET, socket.SO_BROADCAST, 1 )
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
-        # create the request queue
+        # create the request queue and transport
         self.request = queue.Queue()
+        self.transport = None
+        self._protocol = None
 
         # start with an empty peer pool
         self.peers = {}
+
+        # get the event loop and start the protocol
+        self.loop = asyncio.get_event_loop()
+        self.loop.create_task(self.start_protocol())
+
+    async def start_protocol(self):
+        if _debug: UDPDirector._debug("start_protocol")
+        try:
+            self.transport, self._protocol = await self.loop.create_datagram_endpoint(
+                lambda: UDPDirectorProtocol(self),
+                sock=self.socket
+            )
+        except Exception as err:
+            if _debug: UDPDirector._debug("    - protocol error: %r", err)
+            self.handle_error(err)
+
+    def close(self):
+        if _debug: UDPDirector._debug("close")
+        if self.transport:
+            self.transport.close()
+
+    def handle_error(self, error):
+        if _debug: UDPDirector._debug("handle_error %r", error)
+        self.close()
 
     def add_actor(self, actor):
         """Add an actor when a new one is connected."""
@@ -284,6 +332,20 @@ class UDPDirector(asyncore.dispatcher, Server, ServiceAccessPoint):
 
         # send the message
         peer.indication(pdu)
+
+        # send the data through the transport
+        if self.transport:
+            try:
+                if isinstance(pdu.pduData, bytes):
+                    data = pdu.pduData
+                else:
+                    data = str(pdu.pduData).encode()
+                self.transport.sendto(data, addr)
+            except Exception as err:
+                if _debug: UDPDirector._debug("    - send error: %r", err)
+                self.handle_error(err)
+        else:
+            if _debug: UDPDirector._debug("    - no transport available")
 
     def _response(self, pdu):
         """Incoming datagrams are routed through an actor."""

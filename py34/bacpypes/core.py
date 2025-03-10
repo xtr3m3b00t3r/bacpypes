@@ -5,7 +5,7 @@ Core
 """
 
 import sys
-import asyncore
+import asyncio
 import signal
 import threading
 import time
@@ -103,6 +103,7 @@ SPIN = 1.0
 def run(spin=SPIN, sigterm=stop, sigusr1=print_stack):
     if _debug: run._debug("run spin=%r sigterm=%r, sigusr1=%r", spin, sigterm, sigusr1)
     global running, taskManager, deferredFns, sleeptime
+    running = True
 
     # install the signal handlers if they have been provided (issue #112)
     if isinstance(threading.current_thread(), threading._MainThread):
@@ -116,64 +117,69 @@ def run(spin=SPIN, sigterm=stop, sigusr1=print_stack):
     # reference the task manager (a singleton)
     taskManager = TaskManager()
 
-    # count how many times we are going through the loop
-    loopCount = 0
+    # get or create the event loop
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
-    running = True
-    while running:
-#       if _debug: run._debug("    - time: %r", time.time())
-        loopCount += 1
+    async def process_tasks():
+        while running:
+            # get the next task
+            task, delta = taskManager.get_next_task()
 
-        # get the next task
-        task, delta = taskManager.get_next_task()
+            try:
+                # if there is a task to process, do it
+                if task:
+                    taskManager.process_task(task)
 
+                # if delta is None, there are no tasks, default to spinning
+                if delta is None:
+                    delta = spin
+
+                # there may be threads around, sleep for a bit
+                if sleeptime and (delta > sleeptime):
+                    await asyncio.sleep(sleeptime)
+                    delta -= sleeptime
+
+                # delta should be no more than the spin value
+                delta = min(delta, spin)
+
+                # if there are deferred functions, use a small delta
+                if deferredFns:
+                    delta = min(delta, 0.001)
+
+                # wait for the specified delta
+                await asyncio.sleep(delta)
+
+                # check for deferred functions
+                while deferredFns:
+                    # get a reference to the list
+                    fnlist = deferredFns
+                    deferredFns = []
+
+                    # call the functions
+                    for fn, args, kwargs in fnlist:
+                        fn(*args, **kwargs)
+
+                    # done with this list
+                    del fnlist
+
+            except Exception as err:
+                run._exception("an error has occurred: %s", err)
+
+    try:
+        loop.run_until_complete(process_tasks())
+    except KeyboardInterrupt:
+        if _debug: run._info("keyboard interrupt")
+        running = False
+    finally:
+        running = False
         try:
-            # if there is a task to process, do it
-            if task:
-                # if _debug: run._debug("    - task: %r", task)
-                taskManager.process_task(task)
-
-            # if delta is None, there are no tasks, default to spinning
-            if delta is None:
-                delta = spin
-
-            # there may be threads around, sleep for a bit
-            if sleeptime and (delta > sleeptime):
-                time.sleep(sleeptime)
-                delta -= sleeptime
-
-            # delta should be no more than the spin value
-            delta = min(delta, spin)
-
-            # if there are deferred functions, use a small delta
-            if deferredFns:
-                delta = min(delta, 0.001)
-#           if _debug: run._debug("    - delta: %r", delta)
-
-            # loop for socket activity
-            asyncore.loop(timeout=delta, count=1)
-
-            # check for deferred functions
-            while deferredFns:
-                # get a reference to the list
-                fnlist = deferredFns
-                deferredFns = []
-
-                # call the functions
-                for fn, args, kwargs in fnlist:
-#                   if _debug: run._debug("    - call: %r %r %r", fn, args, kwargs)
-                    fn(*args, **kwargs)
-
-                # done with this list
-                del fnlist
-
-        except KeyboardInterrupt:
-            if _debug: run._info("keyboard interrupt")
-            running = False
+            loop.close()
         except Exception as err:
-            run._exception("an error has occurred: %s", err)
-
-    running = False
+            if _debug: run._debug("error closing loop: %r", err)
 
 #
 #   run_once

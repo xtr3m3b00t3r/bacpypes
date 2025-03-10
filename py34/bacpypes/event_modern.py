@@ -1,25 +1,17 @@
-#/usr/bin/python
+#!/usr/bin/python
 
 """
-Event
+Event - Modern implementation using asyncio
 """
 
 import asyncio
 import os
 import select
-
 from .debugging import Logging, bacpypes_debugging, ModuleLogger
 
 # some debugging
 _debug = 0
 _log = ModuleLogger(globals())
-
-#
-#   WaitableEvent
-#
-#   An instance of this class can be used like a Threading.Event, but will
-#   work with asyncio event loop.
-#
 
 @bacpypes_debugging
 class WaitableEvent(Logging):
@@ -44,7 +36,7 @@ class WaitableEvent(Logging):
         os.read(self._read_fd, 1)
         self._event.set()
 
-    async def wait_async(self, timeout=None):
+    async def wait(self, timeout=None):
         if timeout is not None:
             try:
                 await asyncio.wait_for(self._event.wait(), timeout)
@@ -55,13 +47,13 @@ class WaitableEvent(Logging):
             await self._event.wait()
             return True
 
-    def wait(self, timeout=None):
-        """Synchronous version of wait for backward compatibility"""
+    def wait_sync(self, timeout=None):
+        """Synchronous version of wait for compatibility"""
         rfds, _, _ = select.select([self._read_fd], [], [], timeout)
         return self._read_fd in rfds
 
     def isSet(self):
-        return self.wait(0)
+        return self.wait_sync(0)
 
     def set(self):
         if _debug: WaitableEvent._debug("set")

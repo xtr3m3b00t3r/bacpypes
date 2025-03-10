@@ -4,7 +4,7 @@
 TCP Communications Module
 """
 
-import asyncore
+import asyncio
 import socket
 import errno
 
@@ -92,7 +92,88 @@ class PickleActorMixIn:
 #
 
 @bacpypes_debugging
-class TCPClient(asyncore.dispatcher):
+class TCPClient:
+    def __init__(self, peer):
+        if _debug: TCPClient._debug("__init__ %r", peer)
+        
+        # create the socket
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.setblocking(False)
+        
+        # save the peer and connection state
+        self.peer = peer
+        self.connected = False
+        self._closing = False
+        
+        # create request buffer and transport
+        self.request = b''
+        self.transport = None
+        
+        # get the event loop
+        self.loop = asyncio.get_event_loop()
+        
+        # start connection
+        self.connect()
+    
+    async def connect(self):
+        if _debug: TCPClient._debug("connect")
+        try:
+            await self.loop.create_connection(
+                lambda: self._protocol_factory(),
+                self.peer[0],
+                self.peer[1]
+            )
+        except Exception as err:
+            if _debug: TCPClient._debug("    - connection error: %r", err)
+            self.handle_error(err)
+    
+    def _protocol_factory(self):
+        return TCPClientProtocol(self)
+    
+    def close(self):
+        if _debug: TCPClient._debug("close")
+        if self.transport:
+            self.transport.close()
+    
+    def handle_connect(self):
+        if _debug: TCPClient._debug("handle_connect")
+        self.connected = True
+    
+    def handle_error(self, error):
+        if _debug: TCPClient._debug("handle_error %r", error)
+        self.close()
+    
+    def indication(self, pdu):
+        if _debug: TCPClient._debug("indication %r", pdu)
+        
+        if isinstance(pdu.pduData, bytes):
+            data = pdu.pduData
+        else:
+            data = pdu.pduData.encode()
+        
+        self.request = data
+        if self.transport and self.connected:
+            self.transport.write(self.request)
+            self.request = b''
+
+class TCPClientProtocol(asyncio.Protocol):
+    def __init__(self, client):
+        self.client = client
+    
+    def connection_made(self, transport):
+        if _debug: TCPClient._debug("connection_made")
+        self.client.transport = transport
+        self.client.handle_connect()
+    
+    def data_received(self, data):
+        if _debug: TCPClient._debug("data_received %r", data)
+        deferred(self.client.response, PDU(data))
+    
+    def connection_lost(self, exc):
+        if _debug: TCPClient._debug("connection_lost %r", exc)
+        self.client.connected = False
+        if exc:
+            self.client.handle_error(exc)
 
     _connect_timeout = CONNECT_TIMEOUT
 
@@ -559,93 +640,94 @@ class TCPClientDirector(Server, ServiceAccessPoint, DebugContents):
 #
 
 @bacpypes_debugging
-class TCPServer(asyncore.dispatcher):
-
+class TCPServer:
     def __init__(self, sock, peer):
         if _debug: TCPServer._debug("__init__ %r %r", sock, peer)
-        asyncore.dispatcher.__init__(self, sock)
-
-        # save the peer
+        
+        # save the peer and socket
         self.peer = peer
-
-        # create a request buffer
+        self.socket = sock
+        self.socket.setblocking(False)
+        
+        # create a request buffer and transport
         self.request = b''
-
-    def handle_connect(self):
-        if _debug: TCPServer._debug("handle_connect")
-
-    def readable(self):
-        return self.connected
-
-    def handle_read(self):
-        if _debug: TCPServer._debug("handle_read")
-
+        self.transport = None
+        
+        # get the event loop
+        self.loop = asyncio.get_event_loop()
+        
+        # create protocol
+        self._protocol = TCPServerProtocol(self)
+        
+        # start serving
+        self.loop.create_task(self.start_serving())
+    
+    async def start_serving(self):
+        if _debug: TCPServer._debug("start_serving")
         try:
-            msg = self.recv(65536)
-            if _debug: TCPServer._debug("    - received %d octets", len(msg))
-
-            # no socket means it was closed
-            if not self.socket:
-                if _debug: TCPServer._debug("    - socket was closed")
-            else:
-                # send the data upstream
-                deferred(self.response, PDU(msg))
-
-        except socket.error as err:
-            if (err.args[0] == errno.ECONNREFUSED):
-                if _debug: TCPServer._debug("    - connection to %r refused", self.peer)
-            else:
-                if _debug: TCPServer._debug("    - recv socket error: %r", err)
-
-            # pass along to a handler
+            self.transport, _ = await self.loop.create_connection(
+                lambda: self._protocol,
+                sock=self.socket
+            )
+        except Exception as err:
+            if _debug: TCPServer._debug("    - server error: %r", err)
             self.handle_error(err)
-
-    def writable(self):
-        return (len(self.request) != 0)
-
-    def handle_write(self):
-        if _debug: TCPServer._debug("handle_write")
-
-        try:
-            sent = self.send(self.request)
-            if _debug: TCPServer._debug("    - sent %d octets, %d remaining", sent, len(self.request) - sent)
-
-            self.request = self.request[sent:]
-
-        except socket.error as err:
-            if (err.args[0] == errno.ECONNREFUSED):
-                if _debug: TCPServer._debug("    - connection to %r refused", self.peer)
-            else:
-                if _debug: TCPServer._debug("    - send socket error: %s", err)
-
-            # sent the exception upstream
-            self.handle_error(err)
-
-    def handle_close(self):
-        if _debug: TCPServer._debug("handle_close")
-
-        if not self:
-            if _debug: TCPServer._debug("    - self is None")
-            return
-        if not self.socket:
-            if _debug: TCPServer._debug("    - socket already closed")
-            return
-
-        self.close()
-        self.socket = None
-
-    def handle_error(self, error=None):
-        """Trap for TCPServer errors, otherwise continue."""
+    
+    def close(self):
+        if _debug: TCPServer._debug("close")
+        if self.transport:
+            self.transport.close()
+    
+    def handle_error(self, error):
         if _debug: TCPServer._debug("handle_error %r", error)
-
-        # core does not take parameters
-        asyncore.dispatcher.handle_error(self)
-
+        self.close()
+    
     def indication(self, pdu):
-        """Requests are queued for delivery."""
         if _debug: TCPServer._debug("indication %r", pdu)
+        
+        if isinstance(pdu.pduData, bytes):
+            data = pdu.pduData
+        else:
+            data = str(pdu.pduData).encode()
+        
+        if self.transport:
+            try:
+                self.transport.write(data)
+            except Exception as err:
+                if _debug: TCPServer._debug("    - send error: %r", err)
+                self.handle_error(err)
+        else:
+            if _debug: TCPServer._debug("    - no transport available")
 
-        self.request += pdu.pduData
+class TCPServerProtocol(asyncio.Protocol):
+    def __init__(self, server):
+        self.server = server
+    
+    def connection_made(self, transport):
+        if _debug: TCPServerProtocol._debug("connection_made %r", transport)
+        self.server.transport = transport
+    
+    def data_received(self, data):
+        if _debug: TCPServerProtocol._debug("data_received %r", data)
+        deferred(self.server.response, PDU(data))
+    
+    def connection_lost(self, exc):
+        if _debug: TCPServerProtocol._debug("connection_lost %r", exc)
+        if exc:
+            self.server.handle_error(exc)
+
+    def __init__(self, server):
+        if _debug: TCPServerProtocol._debug("__init__ %r", server)
+        self.server = server
+
+    def response(self, pdu):
+        if _debug: TCPServerProtocol._debug("response %r", pdu)
+        deferred(self.server.response, pdu)
+
+    def handle_error(self, error):
+        if _debug: TCPServerProtocol._debug("handle_error %r", error)
+        if self.server:
+            self.server.handle_error(error)
 
 #
 #   TCPServerActor
@@ -674,6 +756,122 @@ class TCPServerActor(TCPServer):
 
         # tell the director this is a new actor
         self.director.add_actor(self)
+
+    async def start_serving(self):
+        if _debug: TCPServerActor._debug("start_serving")
+        try:
+            self.transport, _ = await self.loop.create_connection(
+                lambda: self._protocol,
+                sock=self.socket
+            )
+        except Exception as err:
+            if _debug: TCPServerActor._debug("    - server error: %r", err)
+            self.handle_error(err)
+
+    def handle_error(self, error=None):
+        """Trap for TCPServer errors, otherwise continue."""
+        if _debug: TCPServerActor._debug("handle_error %r", error)
+
+        # pass it along to the director
+        self.director.actor_error(self, error)
+
+    def handle_close(self):
+        if _debug: TCPServerActor._debug("handle_close")
+
+        # if there is an idle timeout task, cancel it
+        if self._idle_timeout:
+            self.idle_timeout_task.suspend_task()
+
+        # if there is a flush task, cancel it
+        if self.flush_task:
+            self.flush_task.suspend_task()
+
+        # tell the director this is gone
+        self.director.del_actor(self)
+
+        # pass it down
+        self.close()
+
+    def idle_timeout(self):
+        if _debug: TCPServerActor._debug("idle_timeout")
+
+        # pass it along
+        self.director.actor_idle_timeout(self)
+
+    def indication(self, pdu):
+        if _debug: TCPServerActor._debug("indication %r", pdu)
+
+        # make sure it has a source
+        if not pdu.pduSource:
+            pdu.pduSource = self.director.port
+
+        # send it downstream
+        super(TCPServerActor, self).indication(pdu)
+
+    def response(self, pdu):
+        if _debug: TCPServerActor._debug("response %r", pdu)
+
+        # make sure it has a destination
+        if not pdu.pduDestination:
+            pdu.pduDestination = self.peer
+
+        # send it upstream
+        self.director.response(pdu)
+
+    def flush(self):
+        if _debug: TCPServerActor._debug("flush")
+
+        # pass it along
+        self.director.actor_flush(self)
+
+        # add a timer
+        self._idle_timeout = director.idle_timeout
+        if self._idle_timeout:
+            self.idle_timeout_task = FunctionTask(self.idle_timeout)
+            self.idle_timeout_task.install_task(_time() + self._idle_timeout)
+        else:
+            self.idle_timeout_task = None
+
+        # this may have a flush state
+        self.flush_task = None
+
+        # tell the director this is a new actor
+        self.director.add_actor(self)
+
+    async def start_serving(self):
+        if _debug: TCPServerActor._debug("start_serving")
+        try:
+            self.transport, _ = await self.loop.create_connection(
+                lambda: self._protocol,
+                sock=self.socket
+            )
+        except Exception as err:
+            if _debug: TCPServerActor._debug("    - server error: %r", err)
+            self.handle_error(err)
+
+    def handle_error(self, error=None):
+        """Trap for TCPServer errors, otherwise continue."""
+        if _debug: TCPServerActor._debug("handle_error %r", error)
+
+        # pass it along to the director
+        self.director.actor_error(self, error)
+
+    def handle_close(self):
+        if _debug: TCPServerActor._debug("handle_close")
+
+        # if there is an idle timeout task, cancel it
+        if self._idle_timeout:
+            self.idle_timeout_task.suspend_task()
+
+        # if there is a flush task, cancel it
+        if self.flush_task:
+            self.flush_task.suspend_task()
+
+        # tell the director this is gone
+        self.director.del_actor(self)
+
+        # pass it down
+        self.close()
 
     def handle_error(self, error=None):
         """Trap for TCPServer errors, otherwise continue."""
@@ -769,7 +967,7 @@ class TCPPickleServerActor(PickleActorMixIn, TCPServerActor):
 #
 
 @bacpypes_debugging
-class TCPServerDirector(asyncore.dispatcher, Server, ServiceAccessPoint, DebugContents):
+class TCPServerDirector(Server, ServiceAccessPoint, DebugContents):
 
     _debug_contents = ('port', 'idle_timeout', 'actorClass', 'servers')
 
@@ -793,19 +991,17 @@ class TCPServerDirector(asyncore.dispatcher, Server, ServiceAccessPoint, DebugCo
         # start with an empty pool of servers
         self.servers = {}
 
-        # continue with initialization
-        asyncore.dispatcher.__init__(self)
-
-        # create a listening port
-        self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
+        # create the socket
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.setblocking(False)
         if reuse:
-            self.set_reuse_addr()
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
         # try to bind, keep trying for a while if its already in use
         hadBindErrors = False
         for i in range(30):
             try:
-                self.bind(address)
+                self.socket.bind(address)
                 break
             except socket.error as err:
                 hadBindErrors = True
@@ -815,11 +1011,39 @@ class TCPServerDirector(asyncore.dispatcher, Server, ServiceAccessPoint, DebugCo
             TCPServerDirector._error('unable to bind')
             raise RuntimeError("unable to bind")
 
-        # if there were some bind errors, generate a meesage that all is OK now
+        # if there were some bind errors, generate a message that all is OK now
         if hadBindErrors:
             TCPServerDirector._info('bind successful')
 
-        self.listen(listeners)
+        # listen for connections
+        self.socket.listen(listeners)
+
+        # get the event loop and start serving
+        self.loop = asyncio.get_event_loop()
+        self.loop.create_task(self.start_serving())
+
+    async def start_serving(self):
+        if _debug: TCPServerDirector._debug("start_serving")
+        try:
+            while True:
+                client_socket, client_addr = await self.loop.sock_accept(self.socket)
+                if _debug: TCPServerDirector._debug("    - connection from %r", client_addr)
+
+                # create an actor for this connection
+                actor = self.actorClass(self, client_socket, client_addr)
+                self.add_actor(actor)
+
+        except Exception as err:
+            if _debug: TCPServerDirector._debug("    - server error: %r", err)
+            self.handle_error(err)
+
+    def close(self):
+        if _debug: TCPServerDirector._debug("close")
+        self.socket.close()
+
+    def handle_error(self, error):
+        if _debug: TCPServerDirector._debug("handle_error %r", error)
+        self.close()
 
     def handle_accept(self):
         if _debug: TCPServerDirector._debug("handle_accept")
